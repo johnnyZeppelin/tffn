@@ -1,0 +1,27 @@
+data:
+  root: "./SOLID"
+  viewport_dir: "./viewports"
+  restored_dir: "./restored_viewports"
+  mos_files:
+    BPG: "BPGmos.xlsx"
+    JPEG: "JPEGmos.xlsx"
+  num_viewports: 20
+  split_ratio: 0.8
+  seed: 42
+
+model:
+  vmamba_ckpt: "./vmamba/vmamba_s.pth"  # or vmamba_t, adjust as needed
+  resnet_pretrained: true
+  embed_dim: 512  # output feature dim before fusion
+
+train:
+  batch_size: 8      # per GPU (each sample = 20 viewports → memory heavy)
+  num_workers: 4
+  epochs: 50
+  lr: 1e-4
+  weight_decay: 1e-4
+  save_dir: "./checkpoints"
+  log_interval: 10
+
+test:
+  ckpt_path: "./checkpoints/best.pth"

@@ -1,0 +1,9 @@
+torch>=2.0
+torchvision
+numpy
+pandas
+opencv-python
+scikit-learn
+pyyaml
+tqdm
+mamba-ssm  # optional, but VMamba may require custom kernel
