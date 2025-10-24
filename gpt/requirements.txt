@@ -1,0 +1,1 @@
+torch torchvision pandas scipy pillow openpyxl
