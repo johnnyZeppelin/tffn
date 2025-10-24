@@ -1,0 +1,937 @@
+# TFFN for Stereoscopic Omnidirectional Image Quality Assessment (SOLID Dataset)
+This project reproduces the **Three-branch Feature Fusion Network (TFFN)** from the paper, focusing on the SOLID dataset for training and overall quality assessment.
+
+
+## 1. Project Structure
+```
+TFFN_SOIQA/
+├── config.py               # Configuration (paths, hyperparameters)
+├── data_utils.py           # Data loading & preprocessing
+├── model.py                # TFFN model definition (TPF/PDIE/FF blocks)
+├── train.py                # Training pipeline (train/validate)
+├── test.py                 # Test pipeline (evaluate PLCC/SRCC/RMSE)
+├── utils.py                # Helper functions (metrics, image loading)
+├── requirements.txt        # Dependencies
+├── README.md               # Usage instructions
+├── saved_models/           # Trained models (auto-created)
+│   └── best_tffn.pth       # Best model (saved during training)
+├── logs/                   # Training logs (auto-created)
+│   └── training_log.csv
+├── vmamba/                 # Pretrained VMamba (user-provided)
+│   └── vmamba_pretrained.pth
+├── viewports/              # User-provided viewports
+│   ├── BPG_img001_2_0_l0_r0_3dv_00.png
+│   ├── JPEG_img002_2_0_l1_r1_3dv_01.png
+│   └── ...
+├── restored_viewports/     # User-provided restored viewports
+│   ├── BPG_img001_2_0_l0_r0_3dv_00_res.png
+│   ├── JPEG_img002_2_0_l1_r1_3dv_01_res.png
+│   └── ...
+└── SOLID/                  # User-provided SOLID dataset
+    ├── BPG/
+    ├── JPEG/
+    ├── BPGmos.xlsx
+    ├── JPEGmos.xlsx
+    └── README.txt
+```
+
+
+## 2. Dependencies (`requirements.txt`)
+Install dependencies first:
+```txt
+torch==2.1.0
+torchvision==0.16.0
+timm==0.9.12
+pandas==2.1.4
+openpyxl==3.1.2  # For reading Excel MOS files
+scipy==1.11.4     # For PLCC/SRCC
+scikit-learn==1.3.2  # For RMSE
+Pillow==10.1.0    # Image loading
+numpy==1.26.3
+matplotlib==3.8.2 # Log visualization
+opencv-python==4.8.1.78 # Optional (for image processing)
+```
+Install via: `pip install -r requirements.txt`
+
+
+## 3. Configuration (`config.py`)
+Defines paths, hyperparameters, and model settings:
+```python
+import os
+import torch
+
+# -------------------------- Path Configuration --------------------------
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+SOLID_DIR = os.path.join(ROOT_DIR, "SOLID")
+VIEWPORTS_DIR = os.path.join(ROOT_DIR, "viewports")
+RESTORED_VIEWPORTS_DIR = os.path.join(ROOT_DIR, "restored_viewports")
+VMAMBA_DIR = os.path.join(ROOT_DIR, "vmamba")
+SAVED_MODELS_DIR = os.path.join(ROOT_DIR, "saved_models")
+LOGS_DIR = os.path.join(ROOT_DIR, "logs")
+
+# Create directories if not exist
+os.makedirs(SAVED_MODELS_DIR, exist_ok=True)
+os.makedirs(LOGS_DIR, exist_ok=True)
+
+# MOS file paths
+BPG_MOS_PATH = os.path.join(SOLID_DIR, "BPGmos.xlsx")
+JPEG_MOS_PATH = os.path.join(SOLID_DIR, "JPEGmos.xlsx")
+
+# Pretrained VMamba path
+VMAMBA_PRETRAINED = os.path.join(VMAMBA_DIR, "vmamba_pretrained.pth")
+
+# -------------------------- Hyperparameters --------------------------
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+SEED = 42  # For reproducibility
+
+# Data settings
+TRAIN_TEST_SPLIT = 0.8  # 8:2 split
+NUM_VIEWPORTS_PER_IMAGE = 20  # As per paper (20 viewports per image)
+IMAGE_SIZE = (224, 224)  # Resize viewports to 224x224 (ResNet/VMamba input)
+NORMALIZE_MEAN = [0.485, 0.456, 0.406]  # ImageNet mean
+NORMALIZE_STD = [0.229, 0.224, 0.225]   # ImageNet std
+
+# Training settings
+BATCH_SIZE = 32  # As per paper
+EPOCHS = 100
+INIT_LR = 1e-3  # As per paper
+MOMENTUM = 0.9  # SGD momentum
+WEIGHT_DECAY = 1e-4  # Weight decay for regularization
+LOG_INTERVAL = 10  # Log every N batches
+
+# Model settings
+RESNET50_OUT_DIMS = [512, 1024, 2048]  # Stage2 (512), Stage3 (1024), Stage4 (2048)
+SW_MSA_NUM_HEADS = 4  # SW-MSA hyperparameters
+SW_MSA_WINDOW_SIZE = 7
+VMAMBA_OUT_DIM = 768  # Assume VMamba outputs 768-dim features (adjust if needed)
+FF_HIDDEN_DIM = 1024  # Hidden dim for FF block
+```
+
+
+## 4. Data Utilities (`data_utils.py`)
+Loads SOLID dataset, parses viewports/MOS, and creates PyTorch Dataset:
+```python
+import os
+import re
+import pandas as pd
+import numpy as np
+from PIL import Image
+import torch
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchvision import transforms
+from config import *
+
+# -------------------------- MOS Loader --------------------------
+def load_mos_data():
+    """Load MOS from BPGmos.xlsx and JPEGmos.xlsx, return {img_id: overall_mos}"""
+    # Load BPG MOS
+    bpg_mos_df = pd.read_excel(BPG_MOS_PATH)
+    bpg_mos = dict(zip(bpg_mos_df["img_id"], bpg_mos_df["overall"]))
+    
+    # Load JPEG MOS
+    jpeg_mos_df = pd.read_excel(JPEG_MOS_PATH)
+    jpeg_mos = dict(zip(jpeg_mos_df["img_id"], jpeg_mos_df["overall"]))
+    
+    return {"BPG": bpg_mos, "JPEG": jpeg_mos}
+
+# -------------------------- Viewport Parser --------------------------
+def parse_viewport_filename(filename):
+    """Parse viewport filename to get: compress_type, img_id, view_type (l/r), port_num"""
+    # Example filename: BPG_img001_2_0_l0_r0_3dv_02.png
+    pattern = r"^(\w+)_img(\d+)_.*_l(\d+)_r(\d+)_3dv_(\d+)\.png$"
+    match = re.match(pattern, filename)
+    if not match:
+        raise ValueError(f"Invalid viewport filename: {filename}")
+    
+    compress_type = match.group(1)  # BPG/JPEG
+    img_id = int(match.group(2))    # img001 → 1
+    l_level = match.group(3)        # Left view level (l0/l1)
+    r_level = match.group(4)        # Right view level (r0/r1)
+    port_num = int(match.group(5))  # Viewport number (00-19)
+    
+    return {
+        "compress_type": compress_type,
+        "img_id": img_id,
+        "left_view": f"l{l_level}",
+        "right_view": f"r{r_level}",
+        "port_num": port_num,
+        "base_img_name": f"img{img_id:03d}_*_l{l_level}_r{r_level}_3dv.png"  # Base image name
+    }
+
+# -------------------------- Image Transforms --------------------------
+def get_image_transform():
+    """Image preprocessing pipeline"""
+    return transforms.Compose([
+        transforms.Resize(IMAGE_SIZE),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=NORMALIZE_MEAN, std=NORMALIZE_STD)
+    ])
+
+# -------------------------- SOLID Dataset --------------------------
+class SOLIDDataset(Dataset):
+    def __init__(self, viewport_files, restored_viewport_files, mos_dict, transform):
+        self.viewport_files = viewport_files  # List of viewport paths
+        self.restored_viewport_files = restored_viewport_files  # List of restored viewport paths
+        self.mos_dict = mos_dict  # {compress_type: {img_id: mos}}
+        self.transform = transform
+        
+        # Group viewports by base image (1 image → 20 viewports)
+        self.image_groups = self._group_viewports_by_image()
+
+    def _group_viewports_by_image(self):
+        """Group viewports into {base_img_key: (left_ports, right_ports, restored_right_ports, mos)}"""
+        image_groups = {}
+        
+        for vp_path in self.viewport_files:
+            vp_filename = os.path.basename(vp_path)
+            parsed = parse_viewport_filename(vp_filename)
+            
+            # Base key: (compress_type, img_id, left_view, right_view)
+            base_key = (parsed["compress_type"], parsed["img_id"], parsed["left_view"], parsed["right_view"])
+            
+            # Get MOS for this image
+            mos = self.mos_dict[parsed["compress_type"]].get(parsed["img_id"], None)
+            if mos is None:
+                raise ValueError(f"MOS not found for {parsed['compress_type']} img_id {parsed['img_id']}")
+            
+            # Check if base_key exists in groups
+            if base_key not in image_groups:
+                image_groups[base_key] = {
+                    "left_ports": [],   # Left view viewports (sorted by port_num)
+                    "right_ports": [],  # Right view viewports (sorted by port_num)
+                    "restored_right_ports": [],  # Restored right viewports (sorted by port_num)
+                    "mos": mos
+                }
+            
+            # Assign to left/right port
+            if parsed["port_num"] not in [p["port_num"] for p in image_groups[base_key]["left_ports"]]:
+                if parsed["left_view"] in vp_filename:  # Left viewport
+                    image_groups[base_key]["left_ports"].append({
+                        "path": vp_path,
+                        "port_num": parsed["port_num"]
+                    })
+                elif parsed["right_view"] in vp_filename:  # Right viewport
+                    image_groups[base_key]["right_ports"].append({
+                        "path": vp_path,
+                        "port_num": parsed["port_num"]
+                    })
+        
+        # Sort viewports by port_num and find corresponding restored viewports
+        for base_key in image_groups:
+            # Sort left/right ports by port_num
+            image_groups[base_key]["left_ports"].sort(key=lambda x: x["port_num"])
+            image_groups[base_key]["right_ports"].sort(key=lambda x: x["port_num"])
+            
+            # Get restored right viewports (match port_num and add "_res")
+            restored_right = []
+            for right_port in image_groups[base_key]["right_ports"]:
+                right_filename = os.path.basename(right_port["path"])
+                restored_filename = right_filename.replace(".png", "_res.png")
+                restored_path = os.path.join(RESTORED_VIEWPORTS_DIR, restored_filename)
+                
+                if not os.path.exists(restored_path):
+                    raise FileNotFoundError(f"Restored viewport not found: {restored_path}")
+                restored_right.append(restored_path)
+            
+            image_groups[base_key]["restored_right_ports"] = restored_right
+        
+        # Convert to list of tuples (for Dataset __getitem__)
+        return [
+            (
+                [p["path"] for p in group["left_ports"]],
+                [p["path"] for p in group["right_ports"]],
+                group["restored_right_ports"],
+                group["mos"]
+            )
+            for group in image_groups.values()
+            if len(group["left_ports"]) == NUM_VIEWPORTS_PER_IMAGE and 
+               len(group["right_ports"]) == NUM_VIEWPORTS_PER_IMAGE
+        ]
+
+    def __len__(self):
+        return len(self.image_groups)
+
+    def __getitem__(self, idx):
+        left_paths, right_paths, restored_right_paths, mos = self.image_groups[idx]
+        
+        # Load left viewports (NUM_VIEWPORTS_PER_IMAGE × 3 × H × W)
+        left_imgs = torch.stack([
+            self.transform(Image.open(path).convert("RGB")) 
+            for path in left_paths
+        ])
+        
+        # Load right viewports
+        right_imgs = torch.stack([
+            self.transform(Image.open(path).convert("RGB")) 
+            for path in right_paths
+        ])
+        
+        # Load restored right viewports (for PDIE)
+        restored_right_imgs = torch.stack([
+            self.transform(Image.open(path).convert("RGB")) 
+            for path in restored_right_paths
+        ])
+        
+        # Convert MOS to tensor
+        mos_tensor = torch.tensor(mos, dtype=torch.float32)
+        
+        return left_imgs, right_imgs, restored_right_imgs, mos_tensor
+
+# -------------------------- Data Loader Factory --------------------------
+def get_solid_dataloaders():
+    """Create train/test DataLoaders for SOLID dataset"""
+    # Load all viewport files
+    viewport_files = [
+        os.path.join(VIEWPORTS_DIR, f) 
+        for f in os.listdir(VIEWPORTS_DIR) 
+        if f.endswith(".png") and not f.endswith("_res.png")
+    ]
+    
+    # Load all restored viewport files (not used directly, but validated in Dataset)
+    restored_viewport_files = [
+        os.path.join(RESTORED_VIEWPORTS_DIR, f) 
+        for f in os.listdir(RESTORED_VIEWPORTS_DIR) 
+        if f.endswith("_res.png")
+    ]
+    
+    # Load MOS data
+    mos_dict = load_mos_data()
+    
+    # Create Dataset
+    transform = get_image_transform()
+    dataset = SOLIDDataset(viewport_files, restored_viewport_files, mos_dict, transform)
+    
+    # Split into train/test
+    train_size = int(TRAIN_TEST_SPLIT * len(dataset))
+    test_size = len(dataset) - train_size
+    train_dataset, test_dataset = random_split(
+        dataset, [train_size, test_size],
+        generator=torch.Generator().manual_seed(SEED)
+    )
+    
+    # Create DataLoaders
+    train_loader = DataLoader(
+        train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True
+    )
+    
+    print(f"Train set size: {len(train_dataset)} | Test set size: {len(test_dataset)}")
+    return train_loader, test_loader
+```
+
+
+## 5. Model Definition (`model.py`)
+Implements TFFN components (TPF/PDIE/FF blocks) and full model:
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet50
+import timm
+from timm.models.swin_transformer import SwinTransformerBlock
+from config import *
+
+# -------------------------- Helper Blocks --------------------------
+class SWMSA(nn.Module):
+    """Shifted-Windows Multi-Head Self-Attention (SW-MSA) block"""
+    def __init__(self, dim, num_heads=SW_MSA_NUM_HEADS, window_size=SW_MSA_WINDOW_SIZE):
+        super().__init__()
+        self.swin_block = SwinTransformerBlock(
+            dim=dim,
+            num_heads=num_heads,
+            window_size=window_size,
+            shift_size=window_size // 2,  # Shift by half window
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            drop=0.1,
+            attn_drop=0.1
+        )
+    
+    def forward(self, x):
+        # x: (B, N, C) → Swin block input format (batch, num_patches, dim)
+        return self.swin_block(x)
+
+# -------------------------- TPF Block (Two-stream Parallel Fusion) --------------------------
+class TPFBlock(nn.Module):
+    """TPF Block: Extracts binocular difference (BD) and summation (BS) features"""
+    def __init__(self):
+        super().__init__()
+        # Load ResNet50 (modify to output stage2/stage3/stage4 features)
+        self.resnet = resnet50(pretrained=True)  # Use ImageNet pretrained ResNet50
+        self.resnet.layer1 = nn.Identity()  # Stage1 not used (paper uses stage2-4)
+        
+        # BD Block (Binocular Difference)
+        self.bd_swin = nn.ModuleList([
+            SWMSA(dim=dim) for dim in RESNET50_OUT_DIMS
+        ])  # SW-MSA for each stage's left feature
+        self.bd_norm = nn.ModuleList([
+            nn.LayerNorm(dim) for dim in RESNET50_OUT_DIMS
+        ])  # LayerNorm for right feature
+        self.bd_fc = nn.ModuleList([
+            nn.Linear(dim, dim) for dim in RESNET50_OUT_DIMS
+        ])  # FC for feature refinement
+        
+        # BS Block (Binocular Summation)
+        self.bs_global_pool = nn.AdaptiveAvgPool2d((1, 1))  # Global pooling for each stage
+        self.bs_fc = nn.ModuleList([
+            nn.Linear(dim, dim) for dim in RESNET50_OUT_DIMS
+        ])  # FC for feature refinement
+    
+    def _resnet_forward(self, x):
+        """Forward pass of ResNet50 to get stage2/stage3/stage4 features"""
+        # x: (B, V, 3, H, W) → (B×V, 3, H, W) (V=NUM_VIEWPORTS_PER_IMAGE)
+        B, V, C, H, W = x.shape
+        x = x.view(B*V, C, H, W)
+        
+        # Stage0: conv1 + bn1 + relu + maxpool
+        x = self.resnet.conv1(x)
+        x = self.resnet.bn1(x)
+        x = self.resnet.relu(x)
+        x = self.resnet.maxpool(x)
+        
+        # Stage2 (layer2), Stage3 (layer3), Stage4 (layer4)
+        stage2 = self.resnet.layer2(x)  # (B×V, 512, H/8, W/8)
+        stage3 = self.resnet.layer3(stage2)  # (B×V, 1024, H/16, W/16)
+        stage4 = self.resnet.layer4(stage3)  # (B×V, 2048, H/32, W/32)
+        
+        # Reshape back to (B, V, C, H, W)
+        stage2 = stage2.view(B, V, *stage2.shape[1:])
+        stage3 = stage3.view(B, V, *stage3.shape[1:])
+        stage4 = stage4.view(B, V, *stage4.shape[1:])
+        
+        return [stage2, stage3, stage4]
+    
+    def bd_forward(self, left_stages, right_stages):
+        """Forward pass for BD Block: left_stages/right_stages = [stage2, stage3, stage4]"""
+        bd_features = []
+        for i, (left, right) in enumerate(zip(left_stages, right_stages)):
+            B, V, C, H, W = left.shape
+            
+            # Reshape to (B×V, H×W, C) for SW-MSA (flatten spatial dims)
+            left_flat = left.view(B*V, C, H*W).permute(0, 2, 1)  # (B×V, H×W, C)
+            right_flat = right.view(B*V, C, H*W).permute(0, 2, 1)
+            
+            # SW-MSA on left feature + GELU
+            left_swin = self.bd_swin[i](left_flat)
+            left_act = F.gelu(left_swin)
+            
+            # LayerNorm + GELU on right feature
+            right_norm = self.bd_norm[i](right_flat)
+            right_act = F.gelu(right_norm)
+            
+            # Binocular difference: left_act - right_act
+            bd = left_act - right_act  # (B×V, H×W, C)
+            
+            # Residual connection (left_flat) + FC + GELU
+            bd_res = F.gelu(self.bd_fc[i](bd + left_flat))  # (B×V, H×W, C)
+            
+            # Reshape back to (B, V, C, H, W)
+            bd_res = bd_res.permute(0, 2, 1).view(B, V, C, H, W)
+            
+            # Global pooling to (B, V, C)
+            bd_pooled = F.adaptive_avg_pool2d(bd_res, (1, 1)).squeeze(-1).squeeze(-1)
+            bd_features.append(bd_pooled)
+        
+        # Concatenate features from all stages (B, V, 512+1024+2048)
+        return torch.cat(bd_features, dim=-1)
+    
+    def bs_forward(self, left_stages, right_stages):
+        """Forward pass for BS Block: left_stages/right_stages = [stage2, stage3, stage4]"""
+        bs_features = []
+        for i, (left, right) in enumerate(zip(left_stages, right_stages)):
+            B, V, C, H, W = left.shape
+            
+            # Global pooling for left/right (B, V, C)
+            left_pool = F.adaptive_avg_pool2d(left, (1, 1)).squeeze(-1).squeeze(-1)
+            right_pool = F.adaptive_avg_pool2d(right, (1, 1)).squeeze(-1).squeeze(-1)
+            
+            # Binocular summation: left_pool + right_pool
+            bs = left_pool + right_pool  # (B, V, C)
+            
+            # FC + GELU
+            bs_act = F.gelu(self.bs_fc[i](bs))
+            bs_features.append(bs_act)
+        
+        # Concatenate features from all stages (B, V, 512+1024+2048)
+        return torch.cat(bs_features, dim=-1)
+    
+    def forward(self, left_imgs, right_imgs):
+        """
+        Input: left_imgs (B, V, 3, H, W), right_imgs (B, V, 3, H, W)
+        Output: bd_feat (B, V, 3584), bs_feat (B, V, 3584) → 512+1024+2048=3584
+        """
+        # Extract ResNet stages for left/right
+        left_stages = self._resnet_forward(left_imgs)
+        right_stages = self._resnet_forward(right_imgs)
+        
+        # BD and BS features
+        bd_feat = self.bd_forward(left_stages, right_stages)
+        bs_feat = self.bs_forward(left_stages, right_stages)
+        
+        # Average over viewports (B, 3584)
+        bd_feat_avg = bd_feat.mean(dim=1)
+        bs_feat_avg = bs_feat.mean(dim=1)
+        
+        return bd_feat_avg, bs_feat_avg
+
+# -------------------------- PDIE Block (Pseudo-difference Information Extraction) --------------------------
+class PDIEBlock(nn.Module):
+    """PDIE Block: Uses VMamba to extract monocular features from pseudo-difference"""
+    def __init__(self):
+        super().__init__()
+        # Load VMamba (from https://github.com/MzeroMiko/VMamba)
+        self.vmamba = self._load_vmamba()
+        self.vmamba.train()  # Not frozen (update parameters)
+        
+        # Difference map processing
+        self.diff_norm = nn.LayerNorm(VMAMBA_OUT_DIM)
+        self.fc = nn.Linear(VMAMBA_OUT_DIM, VMAMBA_OUT_DIM)
+    
+    def _load_vmamba(self):
+        """Load pretrained VMamba model"""
+        # Import VMamba from the official repo (adjust import based on user's vmamba folder)
+        from vmamba.models.vmamba import VMamba
+        
+        # Initialize VMamba (match pretrained config)
+        vmamba_config = {
+            "img_size": IMAGE_SIZE[0],
+            "in_chans": 3,
+            "embed_dim": 768,
+            "depth": 12,
+            "num_heads": 12,
+            "mlp_ratio": 4.0,
+            "drop_rate": 0.1,
+        }
+        model = VMamba(**vmamba_config)
+        
+        # Load pretrained weights
+        checkpoint = torch.load(VMAMBA_PRETRAINED, map_location=DEVICE)
+        model.load_state_dict(checkpoint["model"], strict=False)
+        
+        # Modify VMamba to output features (not classification)
+        model.head = nn.Identity()  # Remove classification head
+        return model
+    
+    def forward(self, distorted_right, restored_right):
+        """
+        Input: distorted_right (B, V, 3, H, W), restored_right (B, V, 3, H, W)
+        Output: m_feat (B, VMAMBA_OUT_DIM)
+        """
+        B, V, C, H, W = distorted_right.shape
+        
+        # Compute pseudo-difference map: (distorted - restored)
+        diff_map = distorted_right - restored_right  # (B, V, 3, H, W)
+        
+        # Reshape to (B×V, 3, H, W) for VMamba
+        diff_map = diff_map.view(B*V, C, H, W)
+        
+        # Extract VMamba features
+        vmamba_feat = self.vmamba(diff_map)  # (B×V, VMAMBA_OUT_DIM)
+        
+        # Reshape back to (B, V, VMAMBA_OUT_DIM) and average over viewports
+        vmamba_feat = vmamba_feat.view(B, V, VMAMBA_OUT_DIM)
+        m_feat = vmamba_feat.mean(dim=1)  # (B, VMAMBA_OUT_DIM)
+        
+        # Refine with LayerNorm + FC + GELU
+        m_feat = F.gelu(self.fc(self.diff_norm(m_feat)))
+        return m_feat
+
+# -------------------------- FF Block (Feature Fusion) --------------------------
+class FFBlock(nn.Module):
+    """FF Block: Fuses BD, BS, and monocular features"""
+    def __init__(self, bd_dim=3584, bs_dim=3584, m_dim=VMAMBA_OUT_DIM):
+        super().__init__()
+        self.bd_swin = SWMSA(dim=bd_dim)  # SW-MSA on BD feature
+        self.bs_norm = nn.LayerNorm(bs_dim)  # LayerNorm on BS feature
+        self.m_norm = nn.LayerNorm(m_dim)    # LayerNorm on monocular feature
+        
+        # Fusion FC layers
+        self.fc1 = nn.Linear(bd_dim + bs_dim + m_dim, FF_HIDDEN_DIM)
+        self.fc2 = nn.Linear(FF_HIDDEN_DIM, 1)  # Output quality score
+        self.dropout = nn.Dropout(0.1)
+    
+    def forward(self, bd_feat, bs_feat, m_feat):
+        """
+        Input: bd_feat (B, 3584), bs_feat (B, 3584), m_feat (B, VMAMBA_OUT_DIM)
+        Output: score (B, 1)
+        """
+        # Process BD feature: SW-MSA (add dummy spatial dim for SW-MSA)
+        bd_reshaped = bd_feat.unsqueeze(1)  # (B, 1, 3584)
+        bd_processed = self.bd_swin(bd_reshaped).squeeze(1)  # (B, 3584)
+        
+        # Process BS feature: LayerNorm + GELU
+        bs_processed = F.gelu(self.bs_norm(bs_feat))  # (B, 3584)
+        
+        # Process monocular feature: LayerNorm + GELU
+        m_processed = F.gelu(self.m_norm(m_feat))  # (B, VMAMBA_OUT_DIM)
+        
+        # Concatenate all features
+        fused = torch.cat([bd_processed, bs_processed, m_processed], dim=-1)  # (B, 3584+3584+VMAMBA_OUT_DIM)
+        
+        # Predict quality score
+        score = F.gelu(self.fc1(fused))
+        score = self.dropout(score)
+        score = self.fc2(score)
+        
+        return score
+
+# -------------------------- TFFN Full Model --------------------------
+class TFFN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.tpf_block = TPFBlock()
+        self.pdie_block = PDIEBlock()
+        self.ff_block = FFBlock()
+    
+    def forward(self, left_imgs, right_imgs, restored_right_imgs):
+        """
+        Input:
+            left_imgs: (B, V, 3, H, W) → Left view viewports
+            right_imgs: (B, V, 3, H, W) → Right view viewports
+            restored_right_imgs: (B, V, 3, H, W) → Restored right view viewports
+        Output:
+            score: (B, 1) → Predicted quality score
+        """
+        # Step 1: TPF Block → BD and BS features
+        bd_feat, bs_feat = self.tpf_block(left_imgs, right_imgs)
+        
+        # Step 2: PDIE Block → Monocular feature
+        m_feat = self.pdie_block(right_imgs, restored_right_imgs)
+        
+        # Step 3: FF Block → Quality score
+        score = self.ff_block(bd_feat, bs_feat, m_feat)
+        
+        return score
+```
+
+
+## 6. Training Pipeline (`train.py`)
+Implements training loop, validation, and model saving:
+```python
+import os
+import time
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
+from config import *
+from data_utils import get_solid_dataloaders
+from model import TFFN
+from utils import calculate_metrics, save_logs
+
+def train_one_epoch(model, train_loader, criterion, optimizer, epoch):
+    """Train model for one epoch"""
+    model.train()
+    total_loss = 0.0
+    
+    for batch_idx, (left_imgs, right_imgs, restored_right_imgs, mos) in enumerate(train_loader):
+        # Move data to device
+        left_imgs = left_imgs.to(DEVICE)
+        right_imgs = right_imgs.to(DEVICE)
+        restored_right_imgs = restored_right_imgs.to(DEVICE)
+        mos = mos.to(DEVICE).unsqueeze(1)  # (B, 1)
+        
+        # Forward pass
+        optimizer.zero_grad()
+        pred = model(left_imgs, right_imgs, restored_right_imgs)
+        
+        # Compute loss
+        loss = criterion(pred, mos)
+        total_loss += loss.item()
+        
+        # Backward pass + optimize
+        loss.backward()
+        optimizer.step()
+        
+        # Log training progress
+        if (batch_idx + 1) % LOG_INTERVAL == 0:
+            avg_loss = total_loss / (batch_idx + 1)
+            print(f"Epoch [{epoch+1}/{EPOCHS}] | Batch [{batch_idx+1}/{len(train_loader)}] | Loss: {avg_loss:.4f}")
+    
+    return total_loss / len(train_loader)
+
+def validate(model, val_loader, criterion):
+    """Validate model on test set"""
+    model.eval()
+    total_loss = 0.0
+    all_preds = []
+    all_mos = []
+    
+    with torch.no_grad():
+        for left_imgs, right_imgs, restored_right_imgs, mos in val_loader:
+            # Move data to device
+            left_imgs = left_imgs.to(DEVICE)
+            right_imgs = right_imgs.to(DEVICE)
+            restored_right_imgs = restored_right_imgs.to(DEVICE)
+            mos = mos.to(DEVICE).unsqueeze(1)
+            
+            # Forward pass
+            pred = model(left_imgs, right_imgs, restored_right_imgs)
+            
+            # Compute loss
+            loss = criterion(pred, mos)
+            total_loss += loss.item()
+            
+            # Collect preds and MOS for metrics
+            all_preds.extend(pred.cpu().numpy())
+            all_mos.extend(mos.cpu().numpy())
+    
+    # Calculate metrics
+    avg_loss = total_loss / len(val_loader)
+    plcc, srcc, rmse = calculate_metrics(all_preds, all_mos)
+    
+    print(f"Validation | Loss: {avg_loss:.4f} | PLCC: {plcc:.4f} | SRCC: {srcc:.4f} | RMSE: {rmse:.4f}")
+    return avg_loss, plcc, srcc, rmse
+
+def main():
+    # Set random seed for reproducibility
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(SEED)
+    
+    # Load data
+    train_loader, test_loader = get_solid_dataloaders()
+    
+    # Initialize model
+    model = TFFN().to(DEVICE)
+    print(f"Model initialized on {DEVICE}")
+    
+    # Initialize loss and optimizer
+    criterion = nn.MSELoss()  # Euclidean loss = MSE
+    optimizer = optim.SGD(
+        model.parameters(),
+        lr=INIT_LR,
+        momentum=MOMENTUM,
+        weight_decay=WEIGHT_DECAY
+    )
+    scheduler = StepLR(optimizer, step_size=30, gamma=0.1)  # LR decay every 30 epochs
+    
+    # Training logs
+    logs = []
+    best_plcc = 0.0  # Track best model by PLCC
+    
+    # Training loop
+    start_time = time.time()
+    for epoch in range(EPOCHS):
+        print(f"\n=== Epoch [{epoch+1}/{EPOCHS}] ===")
+        
+        # Train
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, epoch)
+        
+        # Validate
+        val_loss, val_plcc, val_srcc, val_rmse = validate(model, test_loader, criterion)
+        
+        # Update scheduler
+        scheduler.step()
+        
+        # Save log
+        logs.append({
+            "epoch": epoch+1,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "val_plcc": val_plcc,
+            "val_srcc": val_srcc,
+            "val_rmse": val_rmse,
+            "lr": optimizer.param_groups[0]["lr"]
+        })
+        
+        # Save best model
+        if val_plcc > best_plcc:
+            best_plcc = val_plcc
+            best_model_path = os.path.join(SAVED_MODELS_DIR, "best_tffn.pth")
+            torch.save({
+                "epoch": epoch+1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "best_plcc": best_plcc
+            }, best_model_path)
+            print(f"Best model saved to {best_model_path} (PLCC: {best_plcc:.4f})")
+    
+    # Save final logs
+    log_path = os.path.join(LOGS_DIR, "training_log.csv")
+    save_logs(logs, log_path)
+    print(f"\nTraining completed in {time.time()-start_time:.2f}s")
+    print(f"Logs saved to {log_path}")
+
+if __name__ == "__main__":
+    main()
+```
+
+
+## 7. Test Pipeline (`test.py`)
+Evaluates the best trained model on the SOLID test set:
+```python
+import torch
+import torch.nn as nn
+from config import *
+from data_utils import get_solid_dataloaders
+from model import TFFN
+from utils import calculate_metrics
+
+def test_best_model():
+    # Set random seed
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(SEED)
+    
+    # Load data (test loader only)
+    _, test_loader = get_solid_dataloaders()
+    
+    # Initialize model
+    model = TFFN().to(DEVICE)
+    
+    # Load best model weights
+    best_model_path = os.path.join(SAVED_MODELS_DIR, "best_tffn.pth")
+    if not os.path.exists(best_model_path):
+        raise FileNotFoundError(f"Best model not found: {best_model_path}")
+    
+    checkpoint = torch.load(best_model_path, map_location=DEVICE)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    print(f"Loaded best model (epoch {checkpoint['epoch']}, PLCC: {checkpoint['best_plcc']:.4f})")
+    
+    # Test model
+    model.eval()
+    all_preds = []
+    all_mos = []
+    
+    with torch.no_grad():
+        for batch_idx, (left_imgs, right_imgs, restored_right_imgs, mos) in enumerate(test_loader):
+            # Move data to device
+            left_imgs = left_imgs.to(DEVICE)
+            right_imgs = right_imgs.to(DEVICE)
+            restored_right_imgs = restored_right_imgs.to(DEVICE)
+            mos = mos.to(DEVICE).unsqueeze(1)
+            
+            # Forward pass
+            pred = model(left_imgs, right_imgs, restored_right_imgs)
+            
+            # Collect results
+            all_preds.extend(pred.cpu().numpy())
+            all_mos.extend(mos.cpu().numpy())
+            
+            # Progress
+            if (batch_idx + 1) % LOG_INTERVAL == 0:
+                print(f"Test Batch [{batch_idx+1}/{len(test_loader)}]")
+    
+    # Calculate metrics
+    plcc, srcc, rmse = calculate_metrics(all_preds, all_mos)
+    
+    # Print results (match Table I SOLID part)
+    print("\n=== SOLID Dataset Test Results ===")
+    print(f"PLCC: {plcc:.4f}")
+    print(f"SRCC: {srcc:.4f}")
+    print(f"RMSE: {rmse:.4f}")
+    
+    # Save results
+    result_path = os.path.join(LOGS_DIR, "test_results.txt")
+    with open(result_path, "w") as f:
+        f.write("SOLID Dataset Test Results\n")
+        f.write(f"PLCC: {plcc:.4f}\n")
+        f.write(f"SRCC: {srcc:.4f}\n")
+        f.write(f"RMSE: {rmse:.4f}\n")
+    print(f"\nResults saved to {result_path}")
+
+if __name__ == "__main__":
+    test_best_model()
+```
+
+
+## 8. Helper Functions (`utils.py`)
+Implements metrics calculation, log saving, and other utilities:
+```python
+import pandas as pd
+import numpy as np
+from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import mean_squared_error
+
+def calculate_metrics(preds, mos):
+    """
+    Calculate PLCC, SRCC, and RMSE between predictions and MOS.
+    Input: preds (list of np.array), mos (list of np.array)
+    Output: plcc, srcc, rmse
+    """
+    # Flatten lists to 1D arrays
+    preds_flat = np.concatenate(preds).flatten()
+    mos_flat = np.concatenate(mos).flatten()
+    
+    # PLCC (Pearson Linear Correlation Coefficient)
+    plcc, _ = pearsonr(preds_flat, mos_flat)
+    plcc = max(plcc, 0.0)  # Ensure non-negative (since PLCC ranges 0-1 in paper)
+    
+    # SRCC (Spearman Rank-order Correlation Coefficient)
+    srcc, _ = spearmanr(preds_flat, mos_flat)
+    srcc = max(srcc, 0.0)  # Ensure non-negative
+    
+    # RMSE (Root Mean Squared Error)
+    rmse = np.sqrt(mean_squared_error(mos_flat, preds_flat))
+    
+    return plcc, srcc, rmse
+
+def save_logs(logs, path):
+    """Save training logs to CSV"""
+    df = pd.DataFrame(logs)
+    df.to_csv(path, index=False)
+    print(f"Logs saved to {path}")
+
+def load_model(model, checkpoint_path, device):
+    """Load model weights from checkpoint"""
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    return model, checkpoint
+```
+
+
+## 9. Usage Instructions (`README.md`)
+```markdown
+# TFFN for SOLID Dataset
+
+This project reproduces the TFFN model for Stereoscopic Omnidirectional Image Quality Assessment (SOIQA) on the SOLID dataset.
+
+## Prerequisites
+1. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. Organize datasets as per the project structure (SOLID, viewports, restored_viewports, vmamba).
+3. Ensure pretrained VMamba is in `vmamba/vmamba_pretrained.pth`.
+
+## Training
+Run the training script:
+```bash
+python train.py
+```
+- Trained models are saved to `saved_models/best_tffn.pth`.
+- Training logs are saved to `logs/training_log.csv`.
+
+## Testing
+Run the test script (uses the best trained model):
+```bash
+python test.py
+```
+- Test results (PLCC/SRCC/RMSE) are printed and saved to `logs/test_results.txt`.
+
+## Notes
+- The model uses a 8:2 train/test split (fixed seed=42 for reproducibility).
+- VMamba is not frozen (parameters are updated during training).
+- ResNet50 uses ImageNet pretrained weights for feature extraction.
+```
+
+
+## 10. Zip File Structure
+To package all files into a zip (`TFFN_SOIQA.zip`), include:
+```
+TFFN_SOIQA/
+├── config.py
+├── data_utils.py
+├── model.py
+├── train.py
+├── test.py
+├── utils.py
+├── requirements.txt
+└── README.md
+```
+
+The user will need to add their own `SOLID/`, `viewports/`, `restored_viewports/`, and `vmamba/` folders to the unzipped directory before running.

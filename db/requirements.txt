@@ -1,0 +1,11 @@
+torch==2.1.0
+torchvision==0.16.0
+timm==0.9.12
+pandas==2.1.4
+openpyxl==3.1.2  # For reading Excel MOS files
+scipy==1.11.4     # For PLCC/SRCC
+scikit-learn==1.3.2  # For RMSE
+Pillow==10.1.0    # Image loading
+numpy==1.26.3
+matplotlib==3.8.2 # Log visualization
+opencv-python==4.8.1.78 # Optional (for image processing)
