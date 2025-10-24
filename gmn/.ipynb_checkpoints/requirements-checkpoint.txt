@@ -1,0 +1,10 @@
+torch
+torchvision
+pandas
+xlrd
+numpy
+scipy
+scikit-learn
+tqdm
+timm
+mamba-ssm # A dependency for vssm (VMamba)
